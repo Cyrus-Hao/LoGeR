@@ -362,20 +362,21 @@ def write_trajectory_txt(output_path: Path, timestamps, translations, quaternion
 
 
 def load_images_from_paths(image_paths, PIXEL_LIMIT=255000, Target_W=None, Target_H=None, verbose=True):
-    sources = []
+    first_img_size = None
     for img_path in image_paths:
         try:
-            sources.append(Image.open(img_path).convert('RGB'))
+            with Image.open(img_path) as first_img:
+                first_img_size = first_img.size
+            break
         except Exception as e:
             print(f"Could not load image {img_path}: {e}")
 
-    if not sources:
+    if first_img_size is None:
         print("No images found or loaded.")
         return torch.empty(0)
 
     if Target_W is None and Target_H is None:
-        first_img = sources[0]
-        W_orig, H_orig = first_img.size
+        W_orig, H_orig = first_img_size
         scale = math.sqrt(PIXEL_LIMIT / (W_orig * H_orig)) if W_orig * H_orig > 0 else 1
         W_target, H_target = W_orig * scale, H_orig * scale
         k, m = round(W_target / 14), round(H_target / 14)
@@ -389,26 +390,29 @@ def load_images_from_paths(image_paths, PIXEL_LIMIT=255000, Target_W=None, Targe
     if verbose:
         print(f"All images will be resized to a uniform size: ({TARGET_W}, {TARGET_H})")
 
-    tensor_list = []
     to_tensor_transform = transforms.ToTensor()
+    images_tensor = torch.empty((len(image_paths), 3, TARGET_H, TARGET_W), dtype=torch.float32)
+    valid_count = 0
     
-    for img_pil in sources:
+    for img_path in image_paths:
         try:
-            resized_img = img_pil.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
-            img_tensor = to_tensor_transform(resized_img)
-            tensor_list.append(img_tensor)
+            with Image.open(img_path) as img_pil:
+                resized_img = img_pil.convert('RGB').resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
+            images_tensor[valid_count].copy_(to_tensor_transform(resized_img))
+            valid_count += 1
         except Exception as e:
-            print(f"Error processing an image: {e}")
+            print(f"Error processing image {img_path}: {e}")
 
-    if not tensor_list:
+    if valid_count == 0:
         return torch.empty(0)
 
-    return torch.stack(tensor_list, dim=0)
+    return images_tensor[:valid_count]
 
 def main():
     args = parser.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    memory_saver_mode = bool(args.skip_viser and args.output_txt)
 
     # Fail fast for local LoGeR checkpoints/configs when files are missing.
     if args.config and not os.path.isfile(args.config):
@@ -557,6 +561,10 @@ def main():
                 'reset_every': args.reset_every if args.reset_every is not None else 0
             })
 
+        if memory_saver_mode:
+            forward_kwargs['output_keys'] = ['camera_poses']
+            print("Memory saver mode enabled: only retaining trajectory outputs during inference.")
+
         # Warmup run to trigger torch.compile (first run has compilation overhead)
         if args.warmup or args.benchmark:
             print("Running warmup inference (to trigger torch.compile)...")
@@ -646,14 +654,17 @@ def main():
             print(f"Sim3 scale log saved to {scale_path}")
 
         # Post-process predictions
-        # Using permute to get (B, S, H, W, C) for easier numpy conversion later
-        raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2) 
-        raw_model_predictions['conf'] = torch.sigmoid(raw_model_predictions['conf'])
+        if not memory_saver_mode:
+            # Using permute to get (B, S, H, W, C) for easier numpy conversion later
+            raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2)
+        if 'conf' in raw_model_predictions and raw_model_predictions['conf'] is not None:
+            raw_model_predictions['conf'] = torch.sigmoid(raw_model_predictions['conf'])
         # Edge mask on depth can be noisy, optional
         # edge = depth_edge(raw_model_predictions['local_points'][..., 2], rtol=0.03)
         # raw_model_predictions['conf'][edge] = 0.0
         if 'local_points' in raw_model_predictions:
             del raw_model_predictions['local_points']
+        del images_tensor
 
         # Convert all tensors to numpy and remove batch dimension
         # Filter out non-tensor values (e.g., window_ttt_losses which is a list)

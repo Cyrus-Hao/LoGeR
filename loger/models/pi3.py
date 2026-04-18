@@ -613,9 +613,17 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         turn_off_ttt = kwargs.pop('turn_off_ttt', False)
         turn_off_swa = kwargs.pop('turn_off_swa', False)
         sim3_scale_mode = kwargs.pop('sim3_scale_mode', 'median')
+        output_keys = kwargs.pop('output_keys', None)
 
         if sim3 and se3:
             raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
+
+        if output_keys is None:
+            requested_output_keys = None
+        elif isinstance(output_keys, str):
+            requested_output_keys = {output_keys}
+        else:
+            requested_output_keys = {str(key) for key in output_keys}
 
         # Ensure at least one decode iteration so that 'hidden' is always defined
         try:
@@ -640,6 +648,29 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         B, N, C, H, W = imgs.shape
         patch_h, patch_w = H // 14, W // 14
+        align_on_resets_without_explicit_pose = reset_every > 0 and not sim3 and not se3
+
+        return_all_outputs = requested_output_keys is None
+        want_points = return_all_outputs or "points" in requested_output_keys
+        want_local_points = return_all_outputs or "local_points" in requested_output_keys
+        want_conf = return_all_outputs or "conf" in requested_output_keys
+        want_camera_poses = return_all_outputs or "camera_poses" in requested_output_keys
+        want_local_camera_poses = return_all_outputs or "local_camera_poses" in requested_output_keys
+        want_metric = return_all_outputs or "metric" in requested_output_keys
+
+        need_local_points = want_local_points or want_points or sim3
+        need_conf = want_conf
+        need_camera_poses = (
+            want_camera_poses
+            or want_points
+            or want_local_camera_poses
+            or sim3
+            or se3
+            or align_on_resets_without_explicit_pose
+        )
+        need_metric = self.pi3x and self.pi3x_metric and (
+            need_local_points or need_camera_poses or want_metric
+        )
 
         # --- Unified Windowed Inference ---
         if window_size <= 0 or window_size >= N:
@@ -773,37 +804,46 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             if hidden is None:
                 continue
 
-            point_hidden = self.point_decoder(hidden, xpos=pos)
-            if self.use_conf and self.conf_decoder is not None:
+            if need_local_points or want_points:
+                point_hidden = self.point_decoder(hidden, xpos=pos)
+            else:
+                point_hidden = None
+            if need_conf and self.use_conf and self.conf_decoder is not None:
                 conf_hidden = self.conf_decoder(hidden, xpos=pos)
             else:
                 conf_hidden = None
             
-            if self.pi3x and self.pi3x_metric:
+            if need_metric:
                 hw = hidden.shape[1]
                 pos_hw = pos.reshape(B, Nw*hw, -1)
                 metric_hidden = self.metric_decoder(self.metric_token.repeat(B, 1, 1), hidden.reshape(B, Nw*hw, -1), xpos=pos_hw[:, 0:1], ypos=pos_hw)
             else:
                 metric_hidden = None
 
-            camera_hidden = self.camera_decoder(hidden, xpos=pos)
+            if need_camera_poses or want_local_camera_poses:
+                camera_hidden = self.camera_decoder(hidden, xpos=pos)
+            else:
+                camera_hidden = None
 
             global_camera_hidden = camera_hidden
 
             with torch.autocast(device_type='cuda', enabled=False):
-                # local points
-                point_hidden = point_hidden.float()
-                if self.pi3x:
-                    xy, z = self.point_head(point_hidden[:, self.patch_start_idx:], patch_h=patch_h, patch_w=patch_w)
-                    xy = xy.permute(0, 2, 3, 1).reshape(B, Nw, H, W, -1)
-                    z = z.permute(0, 2, 3, 1).reshape(B, Nw, H, W, -1)
-                    z = torch.exp(z.clamp(max=15.0))
-                    local_points = torch.cat([xy * z, z], dim=-1)
+                # Skip heavy prediction heads when the caller only needs camera poses.
+                if point_hidden is not None:
+                    point_hidden = point_hidden.float()
+                    if self.pi3x:
+                        xy, z = self.point_head(point_hidden[:, self.patch_start_idx:], patch_h=patch_h, patch_w=patch_w)
+                        xy = xy.permute(0, 2, 3, 1).reshape(B, Nw, H, W, -1)
+                        z = z.permute(0, 2, 3, 1).reshape(B, Nw, H, W, -1)
+                        z = torch.exp(z.clamp(max=15.0))
+                        local_points = torch.cat([xy * z, z], dim=-1)
+                    else:
+                        ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, Nw, H, W, -1)
+                        xy, z = ret.split([2, 1], dim=-1)
+                        z = torch.exp(z)
+                        local_points = torch.cat([xy * z, z], dim=-1)
                 else:
-                    ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, Nw, H, W, -1)
-                    xy, z = ret.split([2, 1], dim=-1)
-                    z = torch.exp(z)
-                    local_points = torch.cat([xy * z, z], dim=-1)
+                    local_points = None
 
                 # confidence
                 if conf_hidden is not None and self.conf_head is not None:
@@ -813,20 +853,23 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     conf = None
 
                 # camera
-                global_camera_hidden = global_camera_hidden.float()
-                camera_poses = self.camera_head(global_camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, Nw, 4, 4)
+                if global_camera_hidden is not None:
+                    global_camera_hidden = global_camera_hidden.float()
+                    camera_poses = self.camera_head(global_camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, Nw, 4, 4)
+                else:
+                    camera_poses = None
                 camera_qvec = None
                 local_camera_poses = None
                 local_camera_qvec = None
 
                 # metric
-                if self.pi3x and self.pi3x_metric and metric_hidden is not None:
+                if metric_hidden is not None:
                     metric = self.metric_head(metric_hidden.float()).reshape(B).exp()
                     
-                    # apply metric to points and camera poses
-                    # points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3] * metric.view(B, 1, 1, 1, 1)
-                    camera_poses[..., :3, 3] = camera_poses[..., :3, 3] * metric.view(B, 1, 1)
-                    local_points = local_points * metric.view(B, 1, 1, 1, 1)
+                    if camera_poses is not None:
+                        camera_poses[..., :3, 3] = camera_poses[..., :3, 3] * metric.view(B, 1, 1)
+                    if local_points is not None:
+                        local_points = local_points * metric.view(B, 1, 1, 1, 1)
                     if local_camera_poses is not None:
                         local_camera_poses[..., :3, 3] = local_camera_poses[..., :3, 3] * metric.view(B, 1, 1)
                 else:
@@ -834,8 +877,11 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
 
             # unproject local points using camera poses
-            with torch.autocast(device_type='cuda', enabled=False):
-                points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
+            if want_points and camera_poses is not None and local_points is not None:
+                with torch.autocast(device_type='cuda', enabled=False):
+                    points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
+            else:
+                points = None
 
 
             def maybe_detach(t, no_detach=no_detach):
@@ -843,16 +889,22 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     return None
                 return t if self.training or no_detach else t.detach().cpu()
 
-            pred_dict = dict(
-                points=maybe_detach(points, no_detach=no_detach),
-                local_points=maybe_detach(local_points, no_detach=no_detach),
-                conf=maybe_detach(conf, no_detach=no_detach),
-                camera_poses=maybe_detach(camera_poses, no_detach=no_detach),
-                local_camera_poses=maybe_detach(local_camera_poses, no_detach=no_detach),
-                camera_qvec=maybe_detach(camera_qvec, no_detach=no_detach),
-                local_camera_qvec=maybe_detach(local_camera_qvec, no_detach=no_detach),
-                metric=maybe_detach(metric, no_detach=no_detach),
-            )
+            pred_dict = {}
+            if want_points:
+                pred_dict["points"] = maybe_detach(points, no_detach=no_detach)
+            if need_local_points:
+                pred_dict["local_points"] = maybe_detach(local_points, no_detach=no_detach)
+            if need_conf:
+                pred_dict["conf"] = maybe_detach(conf, no_detach=no_detach)
+            if need_camera_poses:
+                pred_dict["camera_poses"] = maybe_detach(camera_poses, no_detach=no_detach)
+            if want_local_camera_poses:
+                pred_dict["local_camera_poses"] = maybe_detach(local_camera_poses, no_detach=no_detach)
+            if return_all_outputs:
+                pred_dict["camera_qvec"] = maybe_detach(camera_qvec, no_detach=no_detach)
+                pred_dict["local_camera_qvec"] = maybe_detach(local_camera_qvec, no_detach=no_detach)
+            if want_metric:
+                pred_dict["metric"] = maybe_detach(metric, no_detach=no_detach)
             all_predictions.append(pred_dict)
 
             _evt_after_heads = _cuda_ev()
@@ -885,7 +937,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         # Merge windowed predictions
         _evt_merge_start = _cuda_ev()
-        align_on_resets_without_explicit_pose = reset_every > 0 and not sim3 and not se3
         if sim3:
             _merge_label = "Sim3"
             merged = self._merge_windowed_predictions_sim3(
@@ -915,6 +966,21 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
         if all_attn_gate_scales:
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
+
+        if requested_output_keys is not None:
+            always_keep_keys = {
+                "alignment_mode",
+                "chunk_sim3_scales",
+                "chunk_sim3_poses",
+                "chunk_se3_poses",
+                "avg_gate_scale",
+                "attn_gate_scale",
+            }
+            merged = {
+                key: value
+                for key, value in merged.items()
+                if key in requested_output_keys or key in always_keep_keys
+            }
         
         return merged
 

@@ -268,6 +268,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    seq_name = Path(args.gt).stem
 
     # --- Load data ---
     gt_poses = read_kitti_poses(args.gt)
@@ -340,7 +341,7 @@ def main():
     intra_chunk_error = ate_piecewise
 
     print(f"\n{'='*65}")
-    print(f"ATE Error Decomposition for KITTI Seq 00")
+    print(f"ATE Error Decomposition for KITTI Seq {seq_name}")
     print(f"{'='*65}")
     print(f"  Total ATE (SE3):           {ate_se3:8.4f} m  (100.0%)")
     print(f"  ├─ Scale contribution:     {scale_contribution:8.4f} m  ({100*scale_contribution/ate_se3:5.1f}%)")
@@ -476,7 +477,11 @@ def main():
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    fig.suptitle("KITTI Seq 00: ATE Error Decomposition — Scale vs Pose", fontsize=16, y=0.98)
+    fig.suptitle(
+        f"KITTI Seq {seq_name}: ATE Error Decomposition — Scale vs Pose",
+        fontsize=16,
+        y=0.98,
+    )
     out_path = os.path.join(args.output_dir, "ate_decomposition.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -487,7 +492,7 @@ def main():
     # =====================================================================
     summary_path = os.path.join(args.output_dir, "summary.txt")
     with open(summary_path, 'w') as f:
-        f.write("ATE Error Decomposition — KITTI Seq 00\n")
+        f.write(f"ATE Error Decomposition — KITTI Seq {seq_name}\n")
         f.write(f"{'='*60}\n")
         f.write(f"Frames: {N}, Chunks: {n_chunks}, Window: {args.window_size}, Overlap: {args.overlap_size}\n\n")
         f.write(f"ATE_SE3 (global Sim3):         {ate_se3:.4f} m  (100.0%)\n")
