@@ -107,7 +107,7 @@ case "$mode_key" in
             echo "Error: kitti mode requires --seq (or KITTI_SEQ env var)."
             exit 1
         fi
-        input_path="$REPO_ROOT/data/kitti/dataset/sequences/${seq}/image_2"
+        input_path="/data/shenyou/kitti_od/dataset/sequences/${seq}/image_2"
         end_frame=10000
         ;;
     vbr)

@@ -374,6 +374,13 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         attn_state = ttt_dict.get("attn") if ttt_dict is not None else None
         gate_scales: List[torch.Tensor] = []
         attn_gate_scales: List[torch.Tensor] = []
+        _acc_block_ms = 0.0
+        _acc_ttt_ms = 0.0
+        _acc_swa_ms = 0.0
+        def _dec_ev():
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            return e
         for i in range(len(self.decoder)):
             blk = self.decoder[i]
 
@@ -405,10 +412,14 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             else:
                 hidden_before_block = hidden_for_block # dummy
 
+            _eb0 = _dec_ev()
             hidden = blk(hidden_for_block, xpos=pos_for_block)
+            _eb1 = _dec_ev()
+            torch.cuda.synchronize()
+            _acc_block_ms += _eb0.elapsed_time(_eb1)
 
             if ttt_state is not None and i in ttt_state.get("insert_after", []):
-                # Help static analyzers: ensure non-None
+                _et0 = _dec_ev()
                 assert self.ttt_gate_projs is not None and self.ttt_layers is not None
                 insert_after_list = ttt_state.get("insert_after", [])
                 layer_idx = insert_after_list.index(i)
@@ -418,9 +429,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 tokens_in = tokens_post
 
                 gate_scale = torch.nn.functional.silu(self.ttt_gate_projs[layer_idx](tokens_in))
-                # keep the gate scale to be always 0
-                # if i <= 19: gate_scale = torch.zeros_like(gate_scale)  # turn off ttt
-                if turn_off_ttt: gate_scale = torch.zeros_like(gate_scale)  # turn off ttt
+                if turn_off_ttt: gate_scale = torch.zeros_like(gate_scale)
                 gate_scales.append(gate_scale)
                 info = {
                     "ttt_op_order": ttt_state.get("ttt_op_order", []),
@@ -445,9 +454,13 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 ttt_output_info["w0"][layer_idx] = output["w0"]
                 ttt_output_info["w1"][layer_idx] = output["w1"]
                 ttt_output_info["w2"][layer_idx] = output["w2"]
+                _et1 = _dec_ev()
+                torch.cuda.synchronize()
+                _acc_ttt_ms += _et0.elapsed_time(_et1)
 
             # Sliding Window Attention (SWA)
             if attn_state is not None and i in attn_state.get("insert_after", []):
+                _es0 = _dec_ev()
                 assert self.swa_gate_projs is not None and self.swa_layers is not None
                 insert_after_list = attn_state.get("insert_after", [])
                 layer_idx = insert_after_list.index(i)
@@ -550,6 +563,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     v_new = v_new.detach()
                 
                 ttt_output_info["history"][layer_idx] = {"k": k_new, "v": v_new}
+                _es1 = _dec_ev()
+                torch.cuda.synchronize()
+                _acc_swa_ms += _es0.elapsed_time(_es1)
 
             if i+1 in [len(self.decoder)-1, len(self.decoder)]:
                 final_output.append(hidden.reshape(B*N, hw, -1))
@@ -564,6 +580,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             all_attn_gate_scales = torch.cat([g.flatten() for g in attn_gate_scales])
             if all_attn_gate_scales.numel() > 0:
                 avg_attn_gate_scale = all_attn_gate_scales.abs().mean()
+
+        self._decode_timing = {
+            'block_ms': _acc_block_ms,
+            'ttt_ms': _acc_ttt_ms,
+            'swa_ms': _acc_swa_ms,
+        }
 
         if len(final_output) < 2:
             raise RuntimeError(
@@ -663,16 +685,26 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         all_gate_scales: List[torch.Tensor] = []
         all_attn_gate_scales: List[torch.Tensor] = []
         
+        _chunk_timings: List[float] = []
+        _total_windows = len(windows)
+
+        def _cuda_ev():
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            return e
+
         windows_iter = windows
         for window_idx, (start_idx, end_idx) in enumerate(windows_iter):
+            _evt_start = _cuda_ev()
+
             if reset_every > 0 and window_idx > 0 and window_idx % reset_every == 0:
                 reset_adaptive_states()
             imgs_w = imgs[:, start_idx:end_idx]  # (B, Nw, C, H, W)
             imgs_w = imgs_w.to(self.image_mean.device)
             imgs_w = (imgs_w - self.image_mean) / self.image_std
             Nw = imgs_w.shape[1]
+            _evt_after_transfer = _cuda_ev()
 
-            # Initialize to satisfy static analyzers; will be set inside decode loop
             hidden = None  # type: ignore[assignment]
             pos = None     # type: ignore[assignment]
 
@@ -689,8 +721,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 hidden_input = self.encoder(imgs_flat, is_training=True)
                 if isinstance(hidden_input, dict):
                     hidden_input = hidden_input["x_norm_patchtokens"]
+                _evt_after_encoder = _cuda_ev()
 
-                # Prepare adapter control dictionaries for decode
                 ttt_state = None
                 attn_state = None
 
@@ -725,20 +757,19 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     turn_off_ttt=turn_off_ttt,
                     turn_off_swa=turn_off_swa,
                 )
+                _evt_after_decode = _cuda_ev()
+
                 if decode_avg_gate_scale is not None:
                     all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
                 if decode_avg_attn_gate_scale is not None:
                     all_attn_gate_scales.append(decode_avg_attn_gate_scale.detach().cpu())
 
-                # TODO: get the updated state from the ttt layer
                 if self.ttt_layers is not None and ttt_output_info is not None:
                     w0, w1, w2 = ttt_output_info["w0"], ttt_output_info["w1"], ttt_output_info["w2"]
                 
-                # TODO: get the updated history from the swa layer
                 if ttt_output_info is not None:
                     swa_history = ttt_output_info.get("history", swa_history)
 
-            # If for some reason decoding didn't produce hidden (e.g., empty window), skip this window
             if hidden is None:
                 continue
 
@@ -824,17 +855,46 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             )
             all_predictions.append(pred_dict)
 
+            _evt_after_heads = _cuda_ev()
+            torch.cuda.synchronize()
+            _nw = end_idx - start_idx
+            _t_transfer = _evt_start.elapsed_time(_evt_after_transfer)
+            _t_encoder  = _evt_after_transfer.elapsed_time(_evt_after_encoder)
+            _t_decode   = _evt_after_encoder.elapsed_time(_evt_after_decode)
+            _t_heads    = _evt_after_decode.elapsed_time(_evt_after_heads)
+            _t_total    = _evt_start.elapsed_time(_evt_after_heads)
+            _chunk_timings.append(_t_total)
+
+            _dt = getattr(self, '_decode_timing', {})
+            _t_ttt = _dt.get('ttt_ms', 0.0)
+            _t_swa = _dt.get('swa_ms', 0.0)
+            _t_blk = _dt.get('block_ms', 0.0)
+            _t_dec_other = _t_decode - _t_ttt - _t_swa - _t_blk
+
+            print(f"  [chunk {window_idx+1}/{_total_windows}] frames {start_idx}-{end_idx-1} ({_nw}f) "
+                  f"total={_t_total:.0f}ms ({_t_total/_nw:.1f}/f)")
+            print(f"    transfer={_t_transfer:.0f}  encoder={_t_encoder:.0f}  "
+                  f"decode={_t_decode:.0f} [block={_t_blk:.0f} TTT={_t_ttt:.0f} SWA={_t_swa:.0f} other={_t_dec_other:.0f}]  "
+                  f"heads={_t_heads:.0f}")
+
+        if _chunk_timings:
+            _total_ms = sum(_chunk_timings)
+            _total_frames = imgs.shape[1]
+            print(f"  [summary] {_total_windows} chunks, {_total_frames} frames, "
+                  f"total={_total_ms/1000:.2f}s, avg={_total_ms/_total_frames:.1f} ms/frame")
+
         # Merge windowed predictions
-        # When reset is enabled but explicit Sim3/SE3 alignment is off, keep each reset block
-        # in a stable rigid frame by applying one estimated transform per block.
+        _evt_merge_start = _cuda_ev()
         align_on_resets_without_explicit_pose = reset_every > 0 and not sim3 and not se3
         if sim3:
+            _merge_label = "Sim3"
             merged = self._merge_windowed_predictions_sim3(
                 all_predictions, 
                 allow_scale=True, 
                 scale_mode=sim3_scale_mode,
             )
         elif se3 or align_on_resets_without_explicit_pose:
+            _merge_label = "SE3" if se3 else "reset-rigid"
             merged = self._merge_windowed_predictions_sim3(
                 all_predictions, 
                 allow_scale=False,
@@ -842,7 +902,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 reuse_transform_within_reset_block=align_on_resets_without_explicit_pose,
             )
         else:
+            _merge_label = "concat"
             merged = self._merge_windowed_predictions(all_predictions, eff_window_size, eff_overlap)
+        _evt_merge_end = _cuda_ev()
+        torch.cuda.synchronize()
+        _t_merge = _evt_merge_start.elapsed_time(_evt_merge_end)
+        print(f"  [merge] {_merge_label}: {_t_merge:.1f} ms")
+        if _chunk_timings:
+            _grand_total = sum(_chunk_timings) + _t_merge
+            print(f"  [total] chunks={sum(_chunk_timings)/1000:.2f}s + merge={_t_merge/1000:.2f}s = {_grand_total/1000:.2f}s")
         if all_gate_scales:
             merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
         if all_attn_gate_scales:
@@ -1134,6 +1202,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         block_scale: Optional[torch.Tensor] = None
         block_rot: Optional[torch.Tensor] = None
         block_trans: Optional[torch.Tensor] = None
+        _cumulative_scale = torch.ones_like(one_scale)
 
         for window_idx, pred in enumerate(all_predictions):
             if window_idx == 0:
@@ -1171,7 +1240,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
             if allow_scale and sim3_scales is not None:
                 sim3_scales.append(current_scale.clone())
-                # print(current_scale, 'current_scale-----------------')
+                _cumulative_scale = _cumulative_scale * current_scale
+                print(f"    [sim3 window {window_idx}] relative_scale={current_scale.item():.6f}  "
+                      f"cumulative_scale={_cumulative_scale.item():.6f}")
             pose_mat = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1, 1)
             pose_mat[:, :3, :3] = current_rot
             pose_mat[:, :3, 3] = current_trans
@@ -1262,5 +1333,14 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         if sim3_poses:
             merged[pose_key] = torch.stack(sim3_poses, dim=1)
         merged["alignment_mode"] = "sim3" if allow_scale else "se3"
+
+        if allow_scale and sim3_scales:
+            rel = [s.item() for s in sim3_scales]
+            cum = []
+            c = 1.0
+            for s in rel:
+                c *= s
+                cum.append(c)
+            self._sim3_scale_log = {"relative": rel, "cumulative": cum}
 
         return merged

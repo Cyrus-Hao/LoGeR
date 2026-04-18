@@ -1,0 +1,52 @@
+=== 1. df -h / ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda2       1.8T  1.6T   32G  99% /
+
+=== 2. ls results/viser_pi3_kitti/ ===
+ate_decomposition_00
+ate_decomposition_01
+ate_decomposition_04
+comparison_plots
+LoGeR
+LoGeR_star_se3
+LoGeR_star_sim3
+results_sim3
+
+=== 3. ate_decomposition_* dirs ===
+results/viser_pi3_kitti/ate_decomposition_00
+results/viser_pi3_kitti/ate_decomposition_01
+results/viser_pi3_kitti/ate_decomposition_04
+
+=== Step 4 skipped: ate_decomposition_* already present ===
+
+=== 5. ls results/viser_pi3_kitti/ate_decomposition_*/summary.txt ===
+results/viser_pi3_kitti/ate_decomposition_00/summary.txt
+results/viser_pi3_kitti/ate_decomposition_01/summary.txt
+results/viser_pi3_kitti/ate_decomposition_04/summary.txt
+=== PIPELINE FINISHED 2026-04-08T10:24:08+00:00 ===
+=== 1. df -h / ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda2       1.8T  1.6T   32G  99% /
+
+=== 2. ls results/viser_pi3_kitti/ ===
+ate_decomposition_00
+ate_decomposition_01
+ate_decomposition_04
+comparison_plots
+LoGeR
+LoGeR_star_se3
+LoGeR_star_sim3
+results_sim3
+
+=== 3. ate_decomposition_* dirs ===
+results/viser_pi3_kitti/ate_decomposition_00
+results/viser_pi3_kitti/ate_decomposition_01
+results/viser_pi3_kitti/ate_decomposition_04
+
+=== Step 4 skipped: ate_decomposition_* already present ===
+
+=== 5. ls results/viser_pi3_kitti/ate_decomposition_*/summary.txt ===
+results/viser_pi3_kitti/ate_decomposition_00/summary.txt
+results/viser_pi3_kitti/ate_decomposition_01/summary.txt
+results/viser_pi3_kitti/ate_decomposition_04/summary.txt
+=== PIPELINE FINISHED 2026-04-08T10:24:08+00:00 ===

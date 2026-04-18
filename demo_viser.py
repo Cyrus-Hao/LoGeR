@@ -271,7 +271,7 @@ def run_core_inference(
         
     print(f"Loading images from combined inputs ({len(all_image_names)} images found)...")
     # Use load_images_from_paths to load exactly the images we collected
-    images_tensor = load_images_from_paths(all_image_names, Target_W=target_resolution[0], Target_H=target_resolution[1]).to(device)
+    images_tensor = load_images_from_paths(all_image_names, Target_W=target_resolution[0], Target_H=target_resolution[1])
     print(f"Preprocessed images tensor shape: {images_tensor.shape}")
 
     print("Running inference...")    
@@ -501,9 +501,9 @@ def main():
             
         print(f"Found {len(all_image_names_collected)} images to process.")
         if target_resolution is not None:
-            images_tensor = load_images_from_paths(all_image_names_collected, Target_W=target_resolution[0], Target_H=target_resolution[1]).to(device)
+            images_tensor = load_images_from_paths(all_image_names_collected, Target_W=target_resolution[0], Target_H=target_resolution[1])
         else:
-            images_tensor = load_images_from_paths(all_image_names_collected).to(device)
+            images_tensor = load_images_from_paths(all_image_names_collected)
         
         image_folder_for_sky = os.path.dirname(all_image_names_collected[0]) if all_image_names_collected else None
 
@@ -525,12 +525,15 @@ def main():
                 model_settings = config.get('model', {})
                 se3_from_config = model_settings.get('se3', config.get('se3', False))
                 se3_value = args.se3 if args.se3 is not None else bool(se3_from_config)
+                sim3_value = config.get('sim3', False) or args.sim3
+                if sim3_value and se3_value:
+                    se3_value = False
                 forward_kwargs.update({
                     'window_size': args.window_size if args.window_size is not None else training_settings.get('window_size', -1),
                     'overlap_size': args.overlap_size if args.overlap_size is not None else training_settings.get('overlap_size', 0),
                     'reset_every': args.reset_every if args.reset_every is not None else training_settings.get('reset_every', 0),
                     'num_iterations': config.get('num_iterations', 1), # Or from training_settings
-                    'sim3': config.get('sim3', False) or args.sim3,
+                    'sim3': sim3_value,
                     'sim3_scale_mode': args.sim3_scale_mode,
                     'se3': se3_value,
                     'turn_off_ttt': args.no_ttt,
@@ -595,24 +598,25 @@ def main():
             print(f"{'='*50}\n")
             inference_time = avg_time
         else:
-            # Single timed inference
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            inference_start_time = time.time()
+            # Single timed inference using CUDA events for precise GPU timing
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+            torch.cuda.synchronize()
+            start_event.record()
             
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-                raw_model_predictions = model(images_tensor[None], **forward_kwargs) # Add batch dimension
+                raw_model_predictions = model(images_tensor[None], **forward_kwargs)
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            inference_end_time = time.time()
-            
-            # Calculate and display timing
-            inference_time = inference_end_time - inference_start_time
+            end_event.record()
+            torch.cuda.synchronize()
+
+            inference_time_ms = start_event.elapsed_time(end_event)
+            inference_time = inference_time_ms / 1000.0
             fps = num_frames / inference_time
-            ms_per_frame = (inference_time / num_frames) * 1000
+            ms_per_frame = inference_time_ms / num_frames
             print(f"\n{'='*50}")
-            print(f"Inference Timing Results:")
+            print(f"Inference Timing Results (torch.cuda.Event):")
             print(f"  Total frames: {num_frames}")
             print(f"  Inference time: {inference_time:.3f} seconds")
             print(f"  FPS: {fps:.2f}")
@@ -620,6 +624,26 @@ def main():
             if not args.warmup:
                 print(f"  (Note: First run includes torch.compile overhead. Use --warmup for accurate timing)")
             print(f"{'='*50}\n")
+
+            if args.output_txt:
+                timing_path = args.output_txt.replace('.txt', '.timing.txt')
+                os.makedirs(os.path.dirname(timing_path), exist_ok=True)
+                with open(timing_path, 'w') as tf:
+                    tf.write(f"frames: {num_frames}\n")
+                    tf.write(f"inference_time_s: {inference_time:.4f}\n")
+                    tf.write(f"fps: {fps:.4f}\n")
+                    tf.write(f"ms_per_frame: {ms_per_frame:.4f}\n")
+                print(f"Timing saved to {timing_path}")
+
+        if hasattr(model, '_sim3_scale_log') and args.output_txt:
+            scale_path = args.output_txt.replace('.txt', '.scale.txt')
+            os.makedirs(os.path.dirname(scale_path), exist_ok=True)
+            log = model._sim3_scale_log
+            with open(scale_path, 'w') as sf:
+                sf.write("window,relative_scale,cumulative_scale\n")
+                for i, (r, c) in enumerate(zip(log["relative"], log["cumulative"])):
+                    sf.write(f"{i},{r:.8f},{c:.8f}\n")
+            print(f"Sim3 scale log saved to {scale_path}")
 
         # Post-process predictions
         # Using permute to get (B, S, H, W, C) for easier numpy conversion later
